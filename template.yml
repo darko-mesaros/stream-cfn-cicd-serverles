@@ -5,6 +5,32 @@ Description: >
   #Parameters:
 Resources:
   # --- IAM ---
+  # ECS Role
+  MyECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole'
+  # ECS Execution ROle
+  MyECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
   # CodeDeploy Role 
   MyCodeDeployRole:
     Type: AWS::IAM::Role
@@ -266,3 +292,170 @@ Resources:
         Type: S3 
         Location:
           Ref: ArtifactS3Bucket
+  # --- network ---
+  # VPC
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  # Subnet 01
+  MySubnet01:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: MyVPC
+      CidrBlock: 10.0.0.0/24
+  # Subnet 02
+  MySubnet02:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: MyVPC
+      CidrBlock: 10.0.1.0/24
+  # Internet Gateway
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+  # VPC Gateway Attachment
+  MyAttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+         Ref: MyVPC
+      InternetGatewayId:
+         Ref: MyInternetGateway
+  # Route Table
+  MyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:  
+        Ref: MyVPC
+  # Subnet Route Table Assoc 01
+  MySubnetRouteTableAssociation01:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: MySubnet01
+      RouteTableId:
+        Ref: MyRouteTable
+  # Subnet Route Table Assoc 02
+  MySubnetRouteTableAssociation02:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: MySubnet02
+      RouteTableId:
+        Ref: MyRouteTable
+  # Route
+  MyRoute:
+    Type: AWS::EC2::Route
+    DependsOn: MyInternetGateway
+    Properties:
+       RouteTableId:
+         Ref: MyRouteTable
+       DestinationCidrBlock: 0.0.0.0/0
+       GatewayId:
+         Ref: MyInternetGateway
+  # Security Group
+  MyALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupDescription: Allow http to client host
+        VpcId:
+           Ref: MyVPC
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  # --- load balancers ---
+  # Web Load Balancer
+  MyLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: 'stream-cfn-alb'
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref MyALBSecurityGroup
+      Subnets:
+        - !Ref MySubnet01
+        - !Ref MySubnet02
+  # TargetGroup
+  MyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: '/'
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: 'stream-cfn-targetgroup'
+      Port: 5000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref MyVPC
+  MyListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref MyTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref MyLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  # --- containers ---
+  # ECR
+  MyECRepository: 
+    Type: AWS::ECR::Repository
+    Properties: 
+      RepositoryName: "stream-webapp"
+  # ECS Cluster
+  MyFargateCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: StreamFargateCluster
+  # ECS Definition
+  MyTaskDefinition: 
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+      NetworkMode: 'awsvpc'
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt MyECSExecutionRole.Arn
+      RequiresCompatibilities: 
+        - 'FARGATE'
+      ContainerDefinitions:
+        -
+          Name: "streamContainerDefinition"
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${MyECRepository}'
+          PortMappings:
+            -
+              ContainerPort: 5000
+          #012345678910.dkr.ecr.<region-name>.amazonaws.com/<repository-name>:latest
+  # ECS Service
+  MyECSWebApp: 
+    Type: AWS::ECS::Service
+    DependsOn: MyLoadBalancer
+    Properties: 
+      LaunchType: 'FARGATE'
+      Cluster: !Ref MyFargateCluster
+      DesiredCount: 0
+      TaskDefinition: !Ref MyTaskDefinition
+      LoadBalancers: 
+        - ContainerName: 'streamContainerDefinition'
+          ContainerPort: 5000
+          TargetGroupArn: !Ref MyTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration: 
+          Subnets: 
+            - 
+              !Ref MySubnet01
+            - 
+              !Ref MySubnet02
+
