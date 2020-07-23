@@ -31,20 +31,6 @@ Resources:
             Action: 'sts:AssumeRole'
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
-  # CodeDeploy Role 
-  MyCodeDeployRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Statement:
-        - Action:
-          - sts:AssumeRole
-          Effect: Allow
-          Principal:
-            Service:
-            - codedeploy.amazonaws.com
-        Version: '2012-10-17'
-      Path: "/"
   # CodeBuild Role 
   MyCodeBuildRole:
     Type: AWS::IAM::Role
@@ -71,6 +57,7 @@ Resources:
             - s3:GetObject
             - s3:List*
             - s3:PutObject
+            - ecr:*
             Effect: Allow
             Resource: "*"
   # CodePipeline Service Role
@@ -204,30 +191,16 @@ Resources:
         Type: CODEPIPELINE
       Environment:
         Type: LINUX_CONTAINER
+        PrivilegedMode: true
         ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/standard:1.0
+        Image: aws/codebuild/standard:4.0
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value:  !Ref AWS::Region
+          - Name: REPOSITORY_URI
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${MyECRepository}'
       Source:
         Type: CODEPIPELINE
-  # Deploy
-  ## CodeDeploy Application
-  MyCodeDeployApplication:
-    Type: AWS::CodeDeploy::Application
-    Properties:
-      ApplicationName: cfnStreamLambdaApp
-      ComputePlatform: Lambda
-  ## CodeDeploy Deployment Group
-  MyCodeDeploymentGroup: 
-    Type: AWS::CodeDeploy::DeploymentGroup
-    Properties: 
-      ApplicationName: 
-        Ref: MyCodeDeployApplication
-      DeploymentConfigName: CodeDeployDefault.LambdaCanary10Percent5Minutes
-      DeploymentStyle:
-        DeploymentType: BLUE_GREEN
-        DeploymentOption: WITH_TRAFFIC_CONTROL
-      ServiceRoleArn: 
-        Fn::GetAtt: [ MyCodeDeployRole, Arn ]
-  # Pipeline
   AppPipeline: 
     Type: AWS::CodePipeline::Pipeline 
     Properties: 
@@ -257,7 +230,7 @@ Resources:
             - 
               Name: BuildAction 
               InputArtifacts: 
-                -
+                -  
                   Name: SourceOutput 
               ActionTypeId: 
                 Category: Build 
@@ -281,12 +254,11 @@ Resources:
                 Category: Deploy 
                 Owner: AWS 
                 Version: '1'
-                Provider: CodeDeploy 
+                Provider: ECS
               Configuration: 
-                ApplicationName: 
-                  Ref: MyCodeDeployApplication
-                DeploymentGroupName: 
-                  Ref: MyCodeDeploymentGroup
+                ClusterName: !Ref MyFargateCluster
+                ServiceName: !Ref MyECSWebApp
+                FileName: images.json
               RunOrder: 1 
       ArtifactStore: 
         Type: S3 
@@ -307,6 +279,11 @@ Resources:
       VpcId:
         Ref: MyVPC
       CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select: 
+          - 0
+          - Fn::GetAZs: ""
   # Subnet 02
   MySubnet02:
     Type: AWS::EC2::Subnet
@@ -314,6 +291,11 @@ Resources:
       VpcId:
         Ref: MyVPC
       CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select: 
+          - 1
+          - Fn::GetAZs: ""
   # Internet Gateway
   MyInternetGateway:
     Type: AWS::EC2::InternetGateway
@@ -339,7 +321,6 @@ Resources:
         Ref: MySubnet01
       RouteTableId:
         Ref: MyRouteTable
-  # Subnet Route Table Assoc 02
   MySubnetRouteTableAssociation02:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
@@ -361,18 +342,24 @@ Resources:
   MyALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-        GroupDescription: Allow http to client host
-        VpcId:
-           Ref: MyVPC
-        SecurityGroupIngress:
+      GroupDescription: Allow http to client host
+      VpcId: 
+        Ref: MyVPC
+      SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-        SecurityGroupEgress:
+  MyFargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG For Fargate Tasks
+      VpcId: 
+        Ref: MyVPC
+      SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
+          FromPort: 5000
+          ToPort: 5000 
           CidrIp: 0.0.0.0/0
   # --- load balancers ---
   # Web Load Balancer
@@ -437,7 +424,6 @@ Resources:
           PortMappings:
             -
               ContainerPort: 5000
-          #012345678910.dkr.ecr.<region-name>.amazonaws.com/<repository-name>:latest
   # ECS Service
   MyECSWebApp: 
     Type: AWS::ECS::Service
@@ -445,7 +431,7 @@ Resources:
     Properties: 
       LaunchType: 'FARGATE'
       Cluster: !Ref MyFargateCluster
-      DesiredCount: 0
+      DesiredCount: 3
       TaskDefinition: !Ref MyTaskDefinition
       LoadBalancers: 
         - ContainerName: 'streamContainerDefinition'
@@ -453,6 +439,9 @@ Resources:
           TargetGroupArn: !Ref MyTargetGroup
       NetworkConfiguration:
         AwsvpcConfiguration: 
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref MyFargateSecurityGroup
           Subnets: 
             - 
               !Ref MySubnet01
